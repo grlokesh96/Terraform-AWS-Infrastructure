@@ -4,7 +4,7 @@ data "aws_ami" "amazon_linux" {
 
   filter {
     name   = "name"
-    values = ["al2023-ami-*-x86_64"]
+    values = ["al2023-ami-2023.*-x86_64"]
   }
 
   filter {
@@ -14,24 +14,26 @@ data "aws_ami" "amazon_linux" {
 }
 
 resource "aws_instance" "this" {
-  ami                    = data.aws_ami.amazon_linux.id
-  instance_type          = var.instance_type
-  subnet_id              = var.public_subnet_id
+  ami                  = data.aws_ami.amazon_linux.id
+  instance_type        = var.instance_type
+  subnet_id            = var.public_subnet_id
   vpc_security_group_ids = var.security_group_ids
-  iam_instance_profile   = var.instance_profile_name
-  key_name               = var.key_pair_name
-  monitoring             = true # CKV_AWS_126
-  ebs_optimized          = true # CKV_AWS_135
+  iam_instance_profile = var.instance_profile_name
+  key_name             = var.key_pair_name
+  monitoring           = true # CKV_AWS_126
+  ebs_optimized        = true # CKV_AWS_135
 
   metadata_options {
-    http_tokens   = "required"
-    http_endpoint = "enabled"
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
   }
 
   root_block_device {
-    volume_size = 20
-    volume_type = "gp3"
-    encrypted   = true
+    volume_size           = 20
+    volume_type           = "gp3"
+    encrypted             = true
+    delete_on_termination = true
   }
 
   tags = {
