@@ -341,7 +341,7 @@ jobs:
           cat opa-deny.json
           result="$(cat opa-deny.json)"
           # empty result or [] => compliant, otherwise violations found
-          if [ -n "$result" ] && [ "$result" != "[]" ]; then
+          if [ -n "$result" ] && [ "$result" != "[]" ] && [ "$result" != "set()" ]; then
             echo "::error::OPA policy violations found"
             exit 1
           fi

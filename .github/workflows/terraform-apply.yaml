@@ -77,7 +77,7 @@ jobs:
           terraform_version: "1.6.6"
 
       - name: Terraform Init
-        run: terraform init -backend=false
+        run: terraform init -backend-config="key=envs/${{ matrix.env }}/terraform.tfstate"
 
       - name: Terraform Validate
         run: terraform validate
@@ -149,7 +149,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: tfplan-${{ matrix.env }}
-          path: environments/${{ matrix.env }}
+          path: .
 
       - name: Terraform Apply
         run: terraform apply -input=false -auto-approve tfplan
