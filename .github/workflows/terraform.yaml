@@ -1,0 +1,325 @@
+name: "Terraform CI/CD"
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "environments/**"
+      - "modules/**"
+      - ".github/workflows/terraform.yaml"
+  push:
+    branches: [main]
+    paths:
+      - "environments/**"
+      - "modules/**"
+      - ".github/workflows/terraform.yaml"
+
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: write
+
+env:
+  AWS_REGION: us-east-1
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+jobs:
+  detect-changes:
+    name: "Detect Changed Environments"
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.filter.outputs.changes }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            dev:
+              - 'environments/dev/**'
+              - 'modules/**'
+            staging:
+              - 'environments/staging/**'
+              - 'modules/**'
+            prod:
+              - 'environments/prod/**'
+              - 'modules/**'
+
+  gitleaks:
+    name: "GitLeaks"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run GitLeaks
+        uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  fmt:
+    name: "Terraform fmt"
+    needs: [gitleaks]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.6"
+      - name: terraform fmt (auto-fix)
+        run: terraform fmt -recursive
+      - name: Commit and push formatting fixes
+        env:
+          TARGET_REF: ${{ github.head_ref || github.ref_name }}
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add -A
+            git commit -m "style: terraform fmt auto-fix [skip ci]"
+            git push origin "HEAD:${TARGET_REF}"
+          else
+            echo "No formatting changes needed."
+          fi
+
+  tflint:
+    name: "TFLint"
+    needs: [fmt]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+      - name: Init TFLint
+        run: tflint --init
+      - name: Run TFLint
+        run: tflint -f compact
+
+  checkov:
+    name: "Checkov"
+    needs: [tflint]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          framework: terraform
+          soft_fail: true
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+      - name: Upload SARIF Report
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: checkov-results.sarif
+
+  tfsec:
+    name: "tfsec"
+    needs: [checkov]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          soft_fail: true
+
+  terrascan:
+    name: "Terrascan"
+    needs: [tfsec]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Terrascan
+        uses: tenable/terrascan-action@main
+        with:
+          iac_type: terraform
+          policy_type: aws
+          only_warn: false
+          sarif_upload: true
+          skip_rules: |
+            AC_AWS_0228
+            AC_AWS_0229
+
+  plan:
+    name: "Plan - ${{ matrix.env }}"
+    needs: [detect-changes]
+    if: |
+      needs.detect-changes.outputs.matrix != '[]' && 
+      needs.detect-changes.outputs.matrix != '' &&
+      (github.event_name == 'pull_request' || github.event_name == 'push')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        env: ${{ fromJSON(needs.detect-changes.outputs.matrix) }}
+    defaults:
+      run:
+        working-directory: environments/${{ matrix.env }}
+    outputs:
+      plan_exitcode: ${{ steps.plan.outputs.exitcode }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.6"
+
+      - name: Terraform Init
+        run: terraform init -backend=false
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -out=tfplan -input=false -detailed-exitcode
+          code=$?
+          set -e
+          echo "exitcode=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" -eq 1 ]; then
+            exit 1
+          fi
+          exit 0
+
+      - name: Export plan as JSON
+        run: terraform show -json tfplan > tfplan.json
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.env }}
+          path: |
+            environments/${{ matrix.env }}/tfplan
+            environments/${{ matrix.env }}/tfplan.json
+          retention-days: 5
+
+      - name: Post plan to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('environments/${{ matrix.env }}/tfplan.json', 'utf8');
+            const planJSON = JSON.parse(plan);
+            let output = `### Terraform Plan - \`${{ matrix.env }}\`\n\n`;
+            const create = planJSON.resource_changes.filter(c => c.change.actions.includes('create'));
+            const update = planJSON.resource_changes.filter(c => c.change.actions.includes('update'));
+            const destroy = planJSON.resource_changes.filter(c => c.change.actions.includes('destroy'));
+            output += `| Action | Count |\n|--------|-------|\n`;
+            output += `| Create | ${create.length} |\n`;
+            output += `| Update | ${update.length} |\n`;
+            output += `| Destroy | ${destroy.length} |\n\n`;
+            if (destroy.length > 0) {
+              output += `> :warning: **${destroy.length} resource(s) will be destroyed**\n\n`;
+            }
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+  opa_policy:
+    name: "OPA Policy - ${{ matrix.env }}"
+    needs: [plan, detect-changes]
+    if: github.event_name == 'pull_request' && needs.detect-changes.outputs.matrix != '[]' && needs.detect-changes.outputs.matrix != ''
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        env: ${{ fromJSON(needs.detect-changes.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ matrix.env }}
+          path: environments/${{ matrix.env }}
+      - name: Setup OPA
+        uses: open-policy-agent/setup-opa@v2
+        with:
+          version: latest
+      - name: Run OPA evaluation
+        working-directory: environments/${{ matrix.env }}
+        run: |
+          opa eval --format raw \
+            --data ../../policy/terraform.rego \
+            --input tfplan.json \
+            "data.terraform.policy.deny" > opa-deny.json
+          echo "OPA policy denials:"
+          cat opa-deny.json
+          result="$(cat opa-deny.json)"
+          if [ -n "$result" ] && [ "$result" != "[]" ] && [ "$result" != "set()" ]; then
+            echo "::error::OPA policy violations found"
+            exit 1
+          fi
+
+  apply:
+    name: "Apply - ${{ matrix.env }}"
+    needs: [plan, detect-changes]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.detect-changes.outputs.matrix != '[]' && needs.detect-changes.outputs.matrix != ''
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ matrix.env }}
+    strategy:
+      fail-fast: false
+      matrix:
+        env: ${{ fromJSON(needs.detect-changes.outputs.matrix) }}
+    defaults:
+      run:
+        working-directory: environments/${{ matrix.env }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.6"
+
+      - name: Terraform Init
+        run: terraform init -backend-config="key=envs/${{ matrix.env }}/terraform.tfstate"
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ matrix.env }}
+          path: .
+
+      - name: Terraform Apply
+        run: terraform apply -input=false -auto-approve tfplan
